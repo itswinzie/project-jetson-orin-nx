@@ -1,0 +1,261 @@
+# Jetson Vision Suite
+
+A unified, offline-first vision pipeline for NVIDIA Jetson Orin NX supporting:
+- **Mode 1**: Open-vocabulary object detection via NanoOWL (TensorRT-optimized OWL-ViT)
+- **Mode 2**: Semantic segmentation via DeepStream + TensorRT
+
+Includes a Web UI dashboard, JSON logging, optional Ollama language summarization, and live MJPEG preview.
+
+---
+
+## System Requirements
+
+| Component | Recommended |
+|---|---|
+| Hardware | NVIDIA Jetson Orin NX 8GB or 16GB |
+| JetPack | 5.1.x or 6.0.x (check: `cat /etc/nv_tegra_release`) |
+| DeepStream | 6.3 or 6.4 (check: `deepstream-app --version`) |
+| Python | 3.10+ |
+| CUDA | 11.4+ (JetPack 5.x) or 12.2+ (JetPack 6.x) |
+| TensorRT | 8.5+ |
+| GStreamer | 1.14+ (included with JetPack) |
+| Ollama (optional) | Latest arm64 build |
+
+Check your JetPack version:
+```bash
+cat /etc/nv_tegra_release
+# or
+dpkg -l | grep nvidia-jetpack
+```
+
+Check DeepStream:
+```bash
+deepstream-app --version-all
+```
+
+---
+
+## Installation
+
+```bash
+git clone <repo-url> jetson_vision_suite
+cd jetson_vision_suite
+chmod +x scripts/install_deps.sh run.sh scripts/benchmark.sh
+sudo ./scripts/install_deps.sh
+```
+
+The install script will:
+1. Install system packages (GStreamer plugins, DeepStream Python bindings)
+2. Install Python dependencies into a virtualenv
+3. Pull NanoOWL from GitHub and install it
+4. Create output directories
+
+### Model Setup (Required)
+
+**NanoOWL (Mode 1):**
+```bash
+# After installing NanoOWL, export the TensorRT engine
+python3 -c "
+from nanoowl.owl_predictor import OwlPredictor
+p = OwlPredictor('google/owlvit-base-patch32', image_encoder_engine='/data/models/nanoowl/owl_image_encoder_patch32.engine')
+"
+# Engine will be auto-built and saved to the path above
+# Adjust path in configs/detect.yaml
+```
+
+**Segmentation Model (Mode 2):**
+
+Option A — NVIDIA TAO PeopleSegNet (recommended):
+```bash
+# Download from NGC (requires NGC CLI):
+ngc registry model download-version nvidia/tao/peoplsegnet:deployable_v2.0
+# Convert to TensorRT engine:
+trtexec --onnx=peoplsegnet.onnx \
+        --saveEngine=/data/models/segment/peoplsegnet.engine \
+        --fp16 --workspace=4096
+```
+
+Option B — Any segmentation ONNX (e.g., DeepLabV3+):
+```bash
+trtexec --onnx=deeplabv3.onnx \
+        --saveEngine=/data/models/segment/deeplabv3.engine \
+        --fp16
+```
+Update `configs/segment.yaml` with your engine path and class count.
+
+---
+
+## How to Run
+
+### Quick Start (Web UI)
+```bash
+./run.sh
+# Open browser: http://<jetson-ip>:8080
+```
+
+### CLI Examples
+
+**Detection — USB Camera:**
+```bash
+python3 apps/main.py --mode detect_open_vocab --input camera:0
+```
+
+**Detection — RTSP Stream:**
+```bash
+python3 apps/main.py --mode detect_open_vocab --input "rtsp://192.168.1.100:554/stream"
+```
+
+**Detection — Video File:**
+```bash
+python3 apps/main.py --mode detect_open_vocab --input video:/path/to/video.mp4
+```
+
+**Segmentation — USB Camera:**
+```bash
+python3 apps/main.py --mode segment --input camera:0
+```
+
+**Segmentation — RTSP Stream:**
+```bash
+python3 apps/main.py --mode segment --input "rtsp://192.168.1.100:554/stream"
+```
+
+**Segmentation — Video File:**
+```bash
+python3 apps/main.py --mode segment --input video:/path/to/video.mp4
+```
+
+**With Ollama summaries:**
+```bash
+python3 apps/main.py --mode detect_open_vocab --input camera:0 --enable-ollama
+```
+
+**With recording:**
+```bash
+python3 apps/main.py --mode detect_open_vocab --input camera:0 --record
+```
+
+**With custom prompts:**
+```bash
+python3 apps/main.py --mode detect_open_vocab --input camera:0 \
+  --prompt "person, helmet, safety vest, phone"
+```
+
+---
+
+## Web UI
+
+Open `http://<jetson-ip>:8080` (default port from `configs/web.yaml`).
+
+Features:
+- **Start/Stop** pipeline button
+- **Mode selector**: detect_open_vocab / segment
+- **Input source**: camera index, RTSP URL, or file path
+- **Prompt box** (detection mode): comma-separated labels
+- **Toggles**: tracking, logging, recording, Ollama summaries
+- **Live MJPEG preview** embedded in page
+- **Ollama Q&A**: type a question, get answer from latest metadata
+- **Event log**: last N detections/segmentation events
+
+---
+
+## Troubleshooting
+
+### Camera not opening
+```bash
+# List video devices
+ls -la /dev/video*
+# Test with GStreamer
+gst-launch-1.0 v4l2src device=/dev/video0 ! videoconvert ! autovideosink
+# For CSI camera (IMX219)
+gst-launch-1.0 nvarguscamerasrc sensor-id=0 ! nvvidconv ! autovideosink
+```
+
+### Port already in use
+```bash
+sudo lsof -i :8080
+# Change port in configs/web.yaml
+```
+
+### DeepStream plugin missing
+```bash
+# Verify DeepStream installation
+gst-inspect-1.0 nvinfer
+gst-inspect-1.0 nvvideoconvert
+# If missing, reinstall DeepStream:
+# https://developer.nvidia.com/deepstream-sdk
+```
+
+### TensorRT engine path wrong
+- Check `configs/detect.yaml` → `nanoowl.engine_path`
+- Check `configs/segment.yaml` → `model.engine_path`
+- Rebuild engine if JetPack version changed (engines are NOT portable across CUDA/TRT versions)
+
+### NanoOWL engine build fails
+```bash
+# Ensure you have enough swap
+sudo fallocate -l 8G /swapfile && sudo mkswap /swapfile && sudo swapon /swapfile
+# Try building with reduced precision
+python3 -c "from nanoowl.owl_predictor import OwlPredictor; OwlPredictor('google/owlvit-base-patch32', image_encoder_engine='/data/models/nanoowl/engine.engine')"
+```
+
+### Low FPS
+1. Enable maximum performance mode: `sudo nvpmodel -m 0 && sudo jetson_clocks`
+2. Reduce input resolution in `configs/detect.yaml` or `configs/segment.yaml`
+3. Increase `FRAME_SKIP` in config
+4. Use FP16 for TensorRT engines (add `--fp16` to trtexec)
+
+### Ollama not responding
+```bash
+curl http://localhost:11434/api/tags
+# If fails, start Ollama:
+ollama serve &
+# Pull a small model:
+ollama pull llama3.2:1b
+```
+
+---
+
+## Benchmark
+
+```bash
+./scripts/benchmark.sh
+```
+
+Runs each mode with a test video for 60 seconds and reports avg/min/max FPS and latency.
+
+---
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────┐
+│                  Input Sources                       │
+│  GStreamer: camera / RTSP / video file               │
+└────────────────────┬────────────────────────────────┘
+                     │ frames (numpy/CUDA)
+         ┌───────────▼───────────┐
+         │   Pipeline Core        │
+         │  (apps/main.py)        │
+         └──────┬────────┬───────┘
+                │        │
+    ┌───────────▼┐      ┌▼──────────────────┐
+    │ Mode 1:    │      │ Mode 2:            │
+    │ NanoOWL    │      │ DeepStream         │
+    │ Detection  │      │ Segmentation       │
+    └───────────┬┘      └┬──────────────────┘
+                │        │
+         ┌──────▼────────▼──────┐
+         │   Overlay + Logger   │
+         │   Tracker (Mode 1)   │
+         └──────────┬───────────┘
+                    │
+         ┌──────────▼───────────┐
+         │  Frame Ring Buffer   │
+         └────┬──────────┬──────┘
+              │          │
+   ┌──────────▼──┐  ┌────▼──────────────┐
+   │ MJPEG Server│  │ Ollama Sidecar     │
+   │ (Web UI)    │  │ (async, optional)  │
+   └─────────────┘  └───────────────────┘
+```

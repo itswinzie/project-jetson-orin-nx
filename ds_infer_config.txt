@@ -1,0 +1,139 @@
+#!/usr/bin/env python3
+"""
+core/events.py — Shared event bus.
+
+Provides:
+  - Thread-safe frame ring buffer for MJPEG streaming
+  - Metadata event queue for Ollama sidecar
+  - Recent events list for Web UI
+  - Latest summary string (from Ollama)
+"""
+
+import logging
+import threading
+from collections import deque
+from typing import Optional
+
+import numpy as np
+
+log = logging.getLogger("events")
+
+
+class EventBus:
+    """Central hub for inter-component communication."""
+
+    def __init__(self, max_frames: int = 4, max_events: int = 200):
+        # Frame ring buffer for MJPEG stream
+        self._frame_lock = threading.Lock()
+        self._latest_frame: Optional[np.ndarray] = None
+
+        # Metadata event queue for Ollama
+        self._meta_queue: deque = deque(maxlen=64)
+        self._meta_event = threading.Event()
+        self._meta_lock = threading.Lock()
+
+        # Recent events for Web UI
+        self._events: deque = deque(maxlen=max_events)
+        self._events_lock = threading.Lock()
+
+        # Latest Ollama summary
+        self._summary = ""
+        self._summary_lock = threading.Lock()
+
+        # Runner reference (set from main)
+        self._runner = None
+        self._runner_lock = threading.Lock()
+
+        # Current config / mode
+        self.current_mode: str = "—"
+        self._cfg: dict = {}
+
+    # ── Frame buffer ─────────────────────────────────────────────────────────
+
+    def push_frame(self, frame: np.ndarray, meta: dict):
+        """Push latest processed frame + metadata."""
+        with self._frame_lock:
+            self._latest_frame = frame.copy() if frame is not None else None
+
+        # Also store as event
+        compact_meta = _compact_meta(meta)
+        with self._events_lock:
+            self._events.append(compact_meta)
+
+    def get_latest_frame(self) -> Optional[np.ndarray]:
+        with self._frame_lock:
+            return self._latest_frame
+
+    # ── Metadata events ──────────────────────────────────────────────────────
+
+    def push_meta(self, meta: dict):
+        """Push metadata for Ollama sidecar consumption."""
+        with self._meta_lock:
+            self._meta_queue.append(meta)
+        self._meta_event.set()
+
+    def wait_for_meta(self, timeout: float = 5.0) -> Optional[dict]:
+        """Block until new metadata is available, then return it."""
+        self._meta_event.wait(timeout=timeout)
+        with self._meta_lock:
+            if self._meta_queue:
+                self._meta_event.clear()
+                return self._meta_queue[-1]  # Latest only
+        return None
+
+    def get_recent_meta(self, n: int = 10) -> list:
+        with self._meta_lock:
+            return list(self._meta_queue)[-n:]
+
+    # ── Recent events ────────────────────────────────────────────────────────
+
+    def get_recent_events(self, n: int = 50) -> list:
+        with self._events_lock:
+            return list(self._events)[-n:]
+
+    # ── Summary ──────────────────────────────────────────────────────────────
+
+    def set_summary(self, text: str):
+        with self._summary_lock:
+            self._summary = text
+
+    def get_latest_summary(self) -> str:
+        with self._summary_lock:
+            return self._summary
+
+    # ── Runner reference ─────────────────────────────────────────────────────
+
+    def set_runner(self, runner):
+        with self._runner_lock:
+            self._runner = runner
+
+    def get_runner(self):
+        with self._runner_lock:
+            return self._runner
+
+    def set_cfg(self, cfg: dict, mode: str):
+        self._cfg = cfg
+        self.current_mode = mode
+
+
+def _compact_meta(meta: dict) -> dict:
+    """Reduce metadata to a compact form for Web UI display."""
+    out = {
+        "mode": meta.get("mode", "?"),
+        "fps": round(meta.get("fps", 0), 1),
+        "latency_ms": round(meta.get("latency_ms", 0), 1),
+    }
+
+    if "detections" in meta:
+        dets = meta["detections"]
+        out["n_detections"] = len(dets)
+        out["labels"] = list({d.get("label", "?") for d in dets})[:8]
+
+    if "classes_present" in meta:
+        out["classes"] = meta.get("classes_present", [])[:8]
+
+    if "area_percentages" in meta:
+        # Round percentages
+        out["areas"] = {k: round(v, 2) for k, v in list(meta["area_percentages"].items())[:5]}
+
+    return out

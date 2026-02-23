@@ -1,0 +1,176 @@
+#!/usr/bin/env python3
+"""
+core/overlay.py — Drawing helpers for detection bounding boxes and segmentation masks.
+"""
+
+import logging
+from typing import List, Optional, Tuple
+
+import cv2
+import numpy as np
+
+log = logging.getLogger("overlay")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Color palette (BGR) — used for classes in segmentation
+# ──────────────────────────────────────────────────────────────────────────────
+
+PALETTE_BGR = [
+    (0, 0, 0),        # 0  background — transparent
+    (127, 255, 0),    # 1  person — chartreuse
+    (0, 0, 255),      # 2  vehicle — red
+    (255, 0, 0),      # 3  sky — blue
+    (0, 255, 255),    # 4  road — yellow
+    (255, 0, 255),    # 5  building — magenta
+    (0, 255, 0),      # 6  vegetation — green
+    (128, 0, 0),      # 7
+    (0, 128, 0),      # 8
+    (0, 0, 128),      # 9
+    (128, 128, 0),    # 10
+    (128, 0, 128),    # 11
+    (0, 128, 128),    # 12
+]
+
+
+def _get_color(class_id: int) -> Tuple[int, int, int]:
+    """Return BGR color for a class index."""
+    if class_id < len(PALETTE_BGR):
+        return PALETTE_BGR[class_id]
+    # Random deterministic color for extra classes
+    np.random.seed(class_id * 17 + 5)
+    return tuple(int(x) for x in np.random.randint(80, 255, 3))
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Detection overlay
+# ──────────────────────────────────────────────────────────────────────────────
+
+def draw_detections(frame: np.ndarray, detections: List[dict]) -> np.ndarray:
+    """
+    Draw bounding boxes, labels, confidence, and track IDs on frame.
+
+    Each detection dict:
+      {label, confidence, bbox=[x1,y1,x2,y2], track_id (optional)}
+    """
+    if frame is None:
+        return frame
+
+    out = frame.copy()
+    h, w = out.shape[:2]
+
+    for det in detections:
+        x1, y1, x2, y2 = [int(v) for v in det["bbox"]]
+        label = det.get("label", "?")
+        conf = det.get("confidence", 0.0)
+        tid = det.get("track_id")
+
+        # Clamp to frame
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(w - 1, x2), min(h - 1, y2)
+
+        # Color per label (deterministic hash)
+        color_idx = abs(hash(label)) % len(PALETTE_BGR)
+        color = _get_color(color_idx + 1)  # skip black
+
+        # Box
+        cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
+
+        # Label text
+        text = f"{label} {conf:.2f}"
+        if tid is not None:
+            text = f"[{tid}] {text}"
+
+        (tw, th), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+        ty = max(y1 - 4, th + 4)
+
+        # Text background
+        cv2.rectangle(out, (x1, ty - th - baseline - 2), (x1 + tw + 4, ty + 2), color, -1)
+        cv2.putText(out, text, (x1 + 2, ty - baseline), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
+
+    return out
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Segmentation overlay
+# ──────────────────────────────────────────────────────────────────────────────
+
+def draw_segmentation(
+    frame: np.ndarray,
+    seg_result: dict,
+    overlay_cfg: dict,
+    class_labels: List[str],
+) -> np.ndarray:
+    """
+    Blend a colorized segmentation mask over the input frame.
+
+    seg_result:
+      {
+        "mask": np.ndarray (H, W) int — class indices,
+        "classes_present": [...],
+        "area_percentages": {...},
+      }
+
+    overlay_cfg:
+      {alpha: 0.5, colors: [[R,G,B], ...]}
+    """
+    if frame is None:
+        return frame
+
+    mask = seg_result.get("mask")
+    if mask is None:
+        return frame
+
+    alpha = overlay_cfg.get("alpha", 0.5)
+    colors_rgb = overlay_cfg.get("colors", None)
+
+    h, w = frame.shape[:2]
+
+    # Resize mask to frame size if needed
+    if mask.shape[:2] != (h, w):
+        mask = cv2.resize(mask.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST)
+
+    # Build color image for mask
+    color_mask = np.zeros_like(frame, dtype=np.uint8)
+    num_classes = max(mask.max() + 1, len(class_labels))
+
+    for cls_id in range(num_classes):
+        if colors_rgb and cls_id < len(colors_rgb):
+            r, g, b = colors_rgb[cls_id]
+            bgr = (b, g, r)
+        else:
+            bgr = _get_color(cls_id)
+
+        if cls_id == 0:
+            continue  # skip background (transparent)
+
+        where = mask == cls_id
+        color_mask[where] = bgr
+
+    # Blend
+    out = cv2.addWeighted(frame, 1 - alpha, color_mask, alpha, 0)
+
+    # Draw legend
+    _draw_legend(out, seg_result.get("classes_present", []), class_labels, colors_rgb)
+
+    return out
+
+
+def _draw_legend(
+    frame: np.ndarray,
+    classes_present: List[int],
+    class_labels: List[str],
+    colors_rgb: Optional[List] = None,
+):
+    """Draw a small legend in the top-left corner."""
+    x, y = 10, 10
+    for cls_id in classes_present[:8]:  # max 8 classes in legend
+        label = class_labels[cls_id] if cls_id < len(class_labels) else f"cls{cls_id}"
+        if colors_rgb and cls_id < len(colors_rgb):
+            r, g, b = colors_rgb[cls_id]
+            bgr = (b, g, r)
+        else:
+            bgr = _get_color(cls_id)
+
+        cv2.rectangle(frame, (x, y), (x + 14, y + 14), bgr, -1)
+        cv2.putText(frame, label, (x + 18, y + 12), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+        y += 18

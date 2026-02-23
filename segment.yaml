@@ -1,0 +1,109 @@
+#!/usr/bin/env python3
+"""
+core/logger.py — JSONL event logger with rolling files.
+"""
+
+import json
+import logging
+import os
+import threading
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+
+log = logging.getLogger("logger")
+
+
+class JsonlLogger:
+    """
+    Thread-safe JSONL logger.
+
+    Creates one file per session:
+      outputs/logs/detect_20240101_120000.jsonl
+      outputs/logs/segment_20240101_120000.jsonl
+
+    Each line is a JSON object with timestamp added.
+    """
+
+    def __init__(self, log_dir: str = "outputs/logs", prefix: str = "events"):
+        self.log_dir = Path(log_dir)
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.path = self.log_dir / f"{prefix}_{ts}.jsonl"
+        self._lock = threading.Lock()
+        self._file = None
+        self._pending: list = []
+        self._flush_count = 0
+        self.flush_interval = 30  # lines between flushes
+
+        try:
+            self._file = open(self.path, "a", buffering=1, encoding="utf-8")
+            log.info(f"Logger opened: {self.path}")
+        except OSError as exc:
+            log.error(f"Cannot open log file {self.path}: {exc}")
+
+    def log(self, data: dict):
+        """Append a JSON record. Thread-safe."""
+        if self._file is None:
+            return
+
+        record = {
+            "ts": datetime.utcnow().isoformat() + "Z",
+            **data,
+        }
+
+        # Serialize detections cleanly
+        if "detections" in record:
+            record["detections"] = _serialize_detections(record["detections"])
+
+        line = json.dumps(record, default=_default_serializer) + "\n"
+
+        with self._lock:
+            try:
+                self._file.write(line)
+                self._flush_count += 1
+                if self._flush_count >= self.flush_interval:
+                    self._file.flush()
+                    self._flush_count = 0
+            except OSError as exc:
+                log.warning(f"Log write error: {exc}")
+
+    def close(self):
+        with self._lock:
+            if self._file:
+                try:
+                    self._file.flush()
+                    self._file.close()
+                except OSError:
+                    pass
+                self._file = None
+        log.info(f"Logger closed: {self.path}")
+
+    def __del__(self):
+        self.close()
+
+
+def _serialize_detections(detections) -> list:
+    """Convert detections to JSON-serializable list."""
+    out = []
+    for d in detections:
+        item = {}
+        for k, v in d.items():
+            if hasattr(v, "tolist"):
+                item[k] = v.tolist()
+            elif isinstance(v, float):
+                item[k] = round(v, 4)
+            else:
+                item[k] = v
+        out.append(item)
+    return out
+
+
+def _default_serializer(obj):
+    """Fallback JSON serializer for numpy types etc."""
+    if hasattr(obj, "tolist"):
+        return obj.tolist()
+    if hasattr(obj, "item"):
+        return obj.item()
+    return str(obj)
